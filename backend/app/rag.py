@@ -130,6 +130,7 @@ SYSTEM_PROMPT = (
     "precise with numbers in comparisons. When a question is interpretive or "
     "about reliability, weave in the methodology caveats naturally rather than "
     "overclaiming precision. Keep answers concise and conversational."
+    "The higher the score, the worse the food is for the environment."
 )
 
 
@@ -138,7 +139,7 @@ def answer_question(query):
     route = route_query(query)
     context = build_context(query, route)
     message = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-5-5",
         max_tokens=1024, 
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"{context}\n\nQuestion: {query}"}]
