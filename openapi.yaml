@@ -1,0 +1,1973 @@
+openapi: 3.1.0
+info:
+  title: Plant-Forward Web App API
+  version: 0.1.0
+  summary: Backend API (FastAPI) consumed by the TypeScript web frontend.
+  description: |
+    API contract derived from the "Web App Business Logic" spec document.
+
+    ## Conventions
+    - **JSON field casing:** `snake_case` (FastAPI/Pydantic default). TypeScript clients generated with
+      `openapi-typescript` / `orval` consume it as-is.
+    - **Auth:** short-lived JWT access token sent as `Authorization: Bearer <token>`. The refresh token
+      is set as an `HttpOnly`, `Secure`, `SameSite=Strict` cookie named `refresh_token` and is never
+      exposed to JavaScript.
+    - **Errors:** every non-2xx response uses the `Error` schema. Field-level validation failures
+      (e.g. sign-up) return `422` with `field_errors` so the UI can highlight the offending inputs in red.
+    - **Pagination:** cursor-based. List responses contain `items` and `next_cursor` (null on last page).
+    - **Dates:** `date` = `YYYY-MM-DD`; `date-time` = RFC 3339 in UTC.
+    - **Distances:** miles.
+
+    ## Third-party integrations (server-side only)
+    - Card data is never sent to this API. The frontend collects it with the payment provider's
+      hosted element (assumed Stripe) using the `client_secret` from `/billing/payment-method/setup`.
+    - CAPTCHA token comes from the provider widget (assumed hCaptcha / reCAPTCHA / Turnstile).
+    - Nutrition data: USDA FoodData Central. Environmental impact: Our World in Data. Food cost: TBD provider.
+servers:
+  - url: http://localhost:8000/api/v1
+    description: Local development
+  - url: https://staging.example.com/api/v1
+    description: Staging (placeholder)
+  - url: https://api.example.com/api/v1
+    description: Production (placeholder)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Sign up, sign in (with CAPTCHA and lockout email verification), password reset.
+  - name: Users
+    description: Core user account data and profile.
+  - name: Survey
+    description: Onboarding survey (diet, cuisine preferences, health goals, motivation, income band).
+  - name: Reference
+    description: Static/look-up data used to render the UI (survey options, cuisines, avatars).
+  - name: Billing
+    description: Subscription and payment method (card data handled by third-party provider).
+  - name: Home
+    description: Weekly positive impact, "The Big Picture" community stats, daily quote.
+  - name: Reports
+    description: Detailed environmental, health and savings report filtered by week / month / year.
+  - name: Shopping Lists
+    description: User shopping lists — the data source for impact and savings calculations.
+  - name: Foods
+    description: Food item search (nutrition, environmental impact, cost).
+  - name: Restaurants
+    description: Restaurant finder and favorite restaurants.
+  - name: Recipes
+    description: Recipe finder and favorite recipes.
+  - name: Local Food
+    description: Farmers' markets, co-ops, and local grocers.
+  - name: Get Involved
+    description: Food pantries, soup kitchens, community gardens.
+  - name: Content
+    description: Articles on environmental impact and initiatives.
+  - name: Assistant
+    description: AI assistant conversations (context = latest user snapshot).
+  - name: Support
+    description: Bug reports and contact-us messages.
+
+paths:
+  # ───────────────────────────── AUTH ─────────────────────────────
+  /auth/signup:
+    post:
+      tags: [Auth]
+      operationId: signup
+      summary: Create an account
+      description: |
+        Creates an unverified account and sends a confirmation email. The user stays on the page with
+        the message "Please confirm your email address" until they click the link in the email,
+        which calls `POST /auth/verify-email`.
+
+        Validation failures return `422` with one entry per invalid field. Possible field error codes:
+        `EMAIL_IN_USE`, `INVALID_EMAIL`, `UNDERAGE` (younger than 18), `WEAK_PASSWORD`, `PASSWORD_MISMATCH`, `REQUIRED`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SignupRequest' }
+      responses:
+        '201':
+          description: Account created; confirmation email sent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignupResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/verify-email:
+    post:
+      tags: [Auth]
+      operationId: verify_email
+      summary: Confirm email address from sign-up email link
+      description: On success the user is signed in and sent to the home page (or the survey if not yet completed).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailTokenRequest' }
+      responses:
+        '200':
+          description: Email verified and user signed in. Refresh token cookie is set.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/RefreshTokenCookie' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '400': { $ref: '#/components/responses/InvalidOrExpiredToken' }
+
+  /auth/verify-email/resend:
+    post:
+      tags: [Auth]
+      operationId: resend_verification_email
+      summary: Resend the sign-up confirmation email
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailRequest' }
+      responses:
+        '202': { description: 'If the account exists and is unverified, an email has been sent.' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Sign in with email and password (step 1 of 2)
+      description: |
+        Checks credentials. On success returns a short-lived `challenge_id`; the frontend then shows the
+        CAPTCHA and calls `POST /auth/login/captcha`.
+
+        After **3** consecutive failed attempts the account's sign-in is locked: the API returns `423`
+        with code `EMAIL_CONFIRMATION_REQUIRED` and emails the user a link. Clicking it calls
+        `POST /auth/login/confirm`, which signs them in and takes them to the home page.
+        Failed attempts within the limit return `401` with `attempts_remaining`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Credentials valid; CAPTCHA required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginChallenge' }
+        '401':
+          description: Invalid credentials.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginFailedError' }
+        '403':
+          description: Email not yet verified (`EMAIL_NOT_VERIFIED`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '423':
+          description: Too many failed attempts; confirmation email sent (`EMAIL_CONFIRMATION_REQUIRED`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/login/captcha:
+    post:
+      tags: [Auth]
+      operationId: complete_login_captcha
+      summary: Complete sign-in with CAPTCHA (step 2 of 2)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaptchaRequest' }
+      responses:
+        '200':
+          description: Signed in. Refresh token cookie is set.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/RefreshTokenCookie' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '400':
+          description: CAPTCHA failed (`CAPTCHA_FAILED`) or challenge expired (`CHALLENGE_EXPIRED`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/login/confirm:
+    post:
+      tags: [Auth]
+      operationId: confirm_login_from_email
+      summary: Confirm a locked-out sign-in via the emailed link
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailTokenRequest' }
+      responses:
+        '200':
+          description: Sign-in confirmed, lock cleared, user signed in.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/RefreshTokenCookie' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '400': { $ref: '#/components/responses/InvalidOrExpiredToken' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refresh_access_token
+      summary: Get a new access token using the refresh token cookie
+      security:
+        - refreshCookie: []
+      responses:
+        '200':
+          description: New access token issued; refresh cookie rotated.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/RefreshTokenCookie' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Log out (revokes refresh token and clears cookie)
+      security:
+        - bearerAuth: []
+        - refreshCookie: []
+      responses:
+        '204': { description: Logged out. }
+
+  /auth/password/forgot:
+    post:
+      tags: [Auth]
+      operationId: forgot_password
+      summary: Request a password reset email
+      description: Always returns 202 to avoid revealing whether an email is registered.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailRequest' }
+      responses:
+        '202': { description: Reset email sent if the account exists. }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      operationId: reset_password
+      summary: Set a new password using the emailed reset token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResetPasswordRequest' }
+      responses:
+        '204': { description: Password updated. All existing sessions are revoked. }
+        '400': { $ref: '#/components/responses/InvalidOrExpiredToken' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ───────────────────────────── USERS ─────────────────────────────
+  /users/me:
+    get:
+      tags: [Users]
+      operationId: get_current_user
+      summary: Get the signed-in user's account
+      responses:
+        '200':
+          description: Current user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Users]
+      operationId: update_current_user
+      summary: Update account settings (General tab)
+      description: |
+        Partial update. Changing `email` triggers a confirmation email to the new address; the change
+        takes effect once confirmed (`pending_email` is shown until then).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserUpdate' }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /users/me/password:
+    put:
+      tags: [Users]
+      operationId: change_password
+      summary: Change password while signed in
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePasswordRequest' }
+      responses:
+        '204': { description: Password changed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ───────────────────────────── SURVEY ─────────────────────────────
+  /users/me/survey:
+    get:
+      tags: [Survey]
+      operationId: get_my_survey
+      summary: Get the user's survey answers
+      description: Returns `404` if the user has never started the survey.
+      responses:
+        '200':
+          description: Survey answers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SurveyResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Survey]
+      operationId: save_survey_progress
+      summary: Save answers for one or more survey pages
+      description: |
+        Called as the user advances through each survey page so progress isn't lost.
+        Also used by "Modify my dietary preferences" in account settings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SurveyUpdate' }
+      responses:
+        '200':
+          description: Updated survey answers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SurveyResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /users/me/survey/complete:
+    post:
+      tags: [Survey]
+      operationId: complete_survey
+      summary: Mark the survey complete
+      description: |
+        Validates that all required answers are present (`diet`, `cuisine_ids`, `health_goals`,
+        `motivations`; `income_band` is optional), sets `completed_at`, and flips
+        `User.onboarding_completed` to true. Frontend then navigates to Home.
+      responses:
+        '200':
+          description: Survey completed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SurveyResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ───────────────────────────── REFERENCE ─────────────────────────────
+  /reference/survey-options:
+    get:
+      tags: [Reference]
+      operationId: get_survey_options
+      summary: All options needed to render the survey
+      security: []
+      responses:
+        '200':
+          description: Survey options.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SurveyOptions' }
+
+  /reference/cuisines:
+    get:
+      tags: [Reference]
+      operationId: list_cuisines
+      summary: Cuisine types (with dish image and country flag)
+      description: Used by the survey and by the restaurant / recipe cuisine filters.
+      security: []
+      responses:
+        '200':
+          description: Cuisines.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Cuisine' }
+
+  /reference/avatars:
+    get:
+      tags: [Reference]
+      operationId: list_avatars
+      summary: Selectable characters shown next to "[name]'s journey"
+      security: []
+      responses:
+        '200':
+          description: Avatars.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Avatar' }
+
+  # ───────────────────────────── BILLING ─────────────────────────────
+  /billing/plans:
+    get:
+      tags: [Billing]
+      operationId: list_plans
+      summary: Available subscription tiers
+      security: []
+      responses:
+        '200':
+          description: Plans.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Plan' }
+
+  /billing/subscription:
+    get:
+      tags: [Billing]
+      operationId: get_subscription
+      summary: Current subscription details
+      responses:
+        '200':
+          description: Subscription.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Billing]
+      operationId: create_subscription
+      summary: Subscribe to (or change) a plan
+      description: Requires a saved payment method for paid plans.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionCreate' }
+      responses:
+        '200':
+          description: Subscription active (or pending payment confirmation).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: Payment failed or no payment method on file (`PAYMENT_REQUIRED`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /billing/subscription/cancel:
+    post:
+      tags: [Billing]
+      operationId: cancel_subscription
+      summary: Unsubscribe
+      description: Cancels at the end of the current billing period.
+      responses:
+        '200':
+          description: Subscription set to cancel.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /billing/payment-method/setup:
+    post:
+      tags: [Billing]
+      operationId: create_payment_method_setup
+      summary: Start adding/updating a card via the payment provider
+      description: |
+        Returns a provider `client_secret`. The frontend mounts the provider's card element and confirms
+        the setup directly with the provider; card numbers never touch this API. The provider then
+        notifies the backend via webhook.
+      responses:
+        '200':
+          description: Setup intent created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentSetup' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /billing/payment-method:
+    get:
+      tags: [Billing]
+      operationId: get_payment_method
+      summary: Saved card summary (brand, last 4, expiry)
+      responses:
+        '200':
+          description: Payment method on file.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentMethodSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /billing/webhook:
+    post:
+      tags: [Billing]
+      operationId: payment_provider_webhook
+      summary: Payment provider webhook (server-to-server)
+      description: Not called by the frontend. Verified using the provider's signature header.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200': { description: Event accepted. }
+        '400': { description: Invalid signature. }
+
+  # ───────────────────────────── HOME ─────────────────────────────
+  /home/weekly-impact:
+    get:
+      tags: [Home]
+      operationId: get_weekly_impact
+      summary: '"Your weekly positive impact" graphic and breakdown'
+      parameters:
+        - name: week_start
+          in: query
+          required: false
+          description: Monday of the week to show. Defaults to the current week.
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Weekly impact summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WeeklyImpact' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /home/big-picture:
+    get:
+      tags: [Home]
+      operationId: get_big_picture
+      summary: '"The Big Picture" — community-wide contribution stats'
+      responses:
+        '200':
+          description: Community stats plus things to explore.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BigPicture' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /home/daily-quote:
+    get:
+      tags: [Home]
+      operationId: get_daily_quote
+      summary: Motivational quote of the day (toolbar)
+      responses:
+        '200':
+          description: Quote.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+
+  # ───────────────────────────── REPORTS ─────────────────────────────
+  /reports/me:
+    get:
+      tags: [Reports]
+      operationId: get_my_report
+      summary: Detailed impact report
+      description: Environmental impact, personal health impact, and money saved, for the selected period.
+      parameters:
+        - name: period
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/ReportPeriod' }
+        - name: anchor_date
+          in: query
+          required: false
+          description: Any date inside the period to report on. Defaults to today.
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Report' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ───────────────────────────── SHOPPING LISTS ─────────────────────────────
+  /shopping-lists:
+    get:
+      tags: [Shopping Lists]
+      operationId: list_shopping_lists
+      summary: List the user's shopping lists (newest first)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of shopping lists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShoppingListPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Shopping Lists]
+      operationId: create_shopping_list
+      summary: Create a shopping list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShoppingListCreate' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShoppingList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /shopping-lists/{shopping_list_id}:
+    parameters:
+      - name: shopping_list_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Shopping Lists]
+      operationId: get_shopping_list
+      summary: Get a shopping list
+      responses:
+        '200':
+          description: Shopping list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShoppingList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Shopping Lists]
+      operationId: replace_shopping_list
+      summary: Replace a shopping list's name, date and items
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShoppingListCreate' }
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShoppingList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Shopping Lists]
+      operationId: delete_shopping_list
+      summary: Delete a shopping list
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── FOODS ─────────────────────────────
+  /foods:
+    get:
+      tags: [Foods]
+      operationId: search_foods
+      summary: Search food items
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 100 }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Matching foods.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FoodSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /foods/{food_id}:
+    get:
+      tags: [Foods]
+      operationId: get_food
+      summary: Food details (nutrition, environmental impact, cost)
+      parameters:
+        - name: food_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Food detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FoodDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── RESTAURANTS ─────────────────────────────
+  /restaurants/search:
+    get:
+      tags: [Restaurants]
+      operationId: search_restaurants
+      summary: Find restaurants near a location
+      description: |
+        Provide either `lat` + `lng` (browser geolocation) or `postal_code`. Results are sorted by
+        distance. The same response powers both the map view and the printable list view.
+      parameters:
+        - $ref: '#/components/parameters/Lat'
+        - $ref: '#/components/parameters/Lng'
+        - $ref: '#/components/parameters/PostalCode'
+        - name: diet
+          in: query
+          required: true
+          description: '"I''m looking for" selector.'
+          schema: { $ref: '#/components/schemas/Diet' }
+        - $ref: '#/components/parameters/CuisineIds'
+        - name: radius_miles
+          in: query
+          required: false
+          schema: { type: number, minimum: 1, maximum: 100, default: 10 }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Matching restaurants.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RestaurantPage' }
+        '400': { $ref: '#/components/responses/BadLocation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /restaurants/{restaurant_id}:
+    get:
+      tags: [Restaurants]
+      operationId: get_restaurant
+      summary: Restaurant details
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      responses:
+        '200':
+          description: Restaurant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Restaurant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /users/me/favorites/restaurants:
+    get:
+      tags: [Restaurants]
+      operationId: list_favorite_restaurants
+      summary: Favorite restaurants (My Profile grid)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Favorited restaurants.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RestaurantPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users/me/favorites/restaurants/{restaurant_id}:
+    parameters:
+      - $ref: '#/components/parameters/RestaurantId'
+    put:
+      tags: [Restaurants]
+      operationId: add_favorite_restaurant
+      summary: Favorite a restaurant (heart turns red)
+      description: Idempotent.
+      responses:
+        '204': { description: Favorited. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Restaurants]
+      operationId: remove_favorite_restaurant
+      summary: Un-favorite a restaurant
+      description: Idempotent.
+      responses:
+        '204': { description: Removed from favorites. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ───────────────────────────── RECIPES ─────────────────────────────
+  /recipes:
+    get:
+      tags: [Recipes]
+      operationId: search_recipes
+      summary: Browse / search recipes ("Your discoveries")
+      description: |
+        - `favorites_only=true` corresponds to the "Favorites" cuisine option. If the user has no
+          favorites, returns `409` with code `NO_FAVORITE_RECIPES` (UI message:
+          "please favorite some recipes first prior to selecting this filter!").
+        - `ingredients` is comma-separated (e.g. `ingredients=chickpeas,spinach,garlic`). Recipes are
+          ranked by how many supplied ingredients they use. Malformed input returns `422` with code
+          `INVALID_INGREDIENT_FORMAT` (UI message: "Please follow the formatting instructions!").
+          The frontend should validate this before calling.
+        - The UI shows 8 per screen (2 rows × 4); use `limit` + `cursor` for the horizontal scroller.
+      parameters:
+        - name: diet
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Diet' }
+        - $ref: '#/components/parameters/CuisineIds'
+        - name: favorites_only
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+        - name: ingredients
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 30
+            items: { type: string, minLength: 1, maxLength: 60 }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of recipe cards.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecipeSummaryPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Favorites filter selected but user has no favorites (`NO_FAVORITE_RECIPES`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /recipes/{recipe_id}:
+    get:
+      tags: [Recipes]
+      operationId: get_recipe
+      summary: Full recipe (expanded modal / print view)
+      parameters:
+        - $ref: '#/components/parameters/RecipeId'
+      responses:
+        '200':
+          description: Recipe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /users/me/favorites/recipes:
+    get:
+      tags: [Recipes]
+      operationId: list_favorite_recipes
+      summary: Favorite recipes (My Profile)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Favorited recipes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecipeSummaryPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users/me/favorites/recipes/{recipe_id}:
+    parameters:
+      - $ref: '#/components/parameters/RecipeId'
+    put:
+      tags: [Recipes]
+      operationId: add_favorite_recipe
+      summary: Favorite a recipe
+      description: Idempotent.
+      responses:
+        '204': { description: Favorited. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Recipes]
+      operationId: remove_favorite_recipe
+      summary: Un-favorite a recipe
+      description: Idempotent.
+      responses:
+        '204': { description: Removed from favorites. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ───────────────────────────── LOCAL FOOD ─────────────────────────────
+  /local-food/search:
+    get:
+      tags: [Local Food]
+      operationId: search_local_food
+      summary: Find farmers' markets, co-ops and local grocers
+      description: |
+        `postal_code` defaults to the user's saved address if omitted. Any combination of `types` may be
+        selected; results for each overlap on the map. The UI shows nothing when no type is selected,
+        so it should not call this endpoint in that case.
+      parameters:
+        - $ref: '#/components/parameters/PostalCode'
+        - $ref: '#/components/parameters/LocalSearchRadius'
+        - name: types
+          in: query
+          required: true
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            uniqueItems: true
+            items: { $ref: '#/components/schemas/LocalFoodType' }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Matching locations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LocalFoodPage' }
+        '400': { $ref: '#/components/responses/BadLocation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ───────────────────────────── GET INVOLVED ─────────────────────────────
+  /community/search:
+    get:
+      tags: [Get Involved]
+      operationId: search_community_opportunities
+      summary: Find food pantries, soup kitchens and community gardens
+      description: Same filtering behaviour as `/local-food/search`.
+      parameters:
+        - $ref: '#/components/parameters/PostalCode'
+        - $ref: '#/components/parameters/LocalSearchRadius'
+        - name: types
+          in: query
+          required: true
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            uniqueItems: true
+            items: { $ref: '#/components/schemas/CommunityOrgType' }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Matching locations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommunityOrgPage' }
+        '400': { $ref: '#/components/responses/BadLocation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ───────────────────────────── CONTENT ─────────────────────────────
+  /articles:
+    get:
+      tags: [Content]
+      operationId: list_articles
+      summary: Articles on environmental impact and initiatives
+      parameters:
+        - name: topic
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of articles.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArticlePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ───────────────────────────── ASSISTANT ─────────────────────────────
+  /assistant/conversations:
+    get:
+      tags: [Assistant]
+      operationId: list_conversations
+      summary: List the user's AI conversations
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of conversations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Assistant]
+      operationId: create_conversation
+      summary: Start a new conversation
+      responses:
+        '201':
+          description: Conversation created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /assistant/conversations/{conversation_id}/messages:
+    parameters:
+      - name: conversation_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Assistant]
+      operationId: list_conversation_messages
+      summary: Message history for a conversation
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of messages (oldest first).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Assistant]
+      operationId: send_message
+      summary: Send a message and get the assistant's reply
+      description: |
+        The server injects the user's latest profile snapshot (diet, goals, recent shopping lists, etc.)
+        as model context. Set `Accept: text/event-stream` to stream the reply as Server-Sent Events
+        (`event: delta` with `{"text": "..."}` chunks, then `event: done` with the final `Message`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MessageCreate' }
+      responses:
+        '200':
+          description: Assistant reply.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE stream; see operation description.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ───────────────────────────── SUPPORT ─────────────────────────────
+  /support/bug-reports:
+    post:
+      tags: [Support]
+      operationId: report_bug
+      summary: Report a bug
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BugReportCreate' }
+      responses:
+        '201':
+          description: Bug report received.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupportTicket' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /support/contact:
+    post:
+      tags: [Support]
+      operationId: contact_us
+      summary: Contact us
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContactCreate' }
+      responses:
+        '201':
+          description: Message received.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupportTicket' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /health:
+    get:
+      tags: [Reference]
+      operationId: health_check
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: ok }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+
+  headers:
+    RefreshTokenCookie:
+      description: '`refresh_token=<opaque>; HttpOnly; Secure; SameSite=Strict; Path=/api/v1/auth`'
+      schema: { type: string }
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from a previous page's `next_cursor`.
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Lat:
+      name: lat
+      in: query
+      required: false
+      schema: { type: number, minimum: -90, maximum: 90 }
+    Lng:
+      name: lng
+      in: query
+      required: false
+      schema: { type: number, minimum: -180, maximum: 180 }
+    PostalCode:
+      name: postal_code
+      in: query
+      required: false
+      schema: { type: string, pattern: '^\d{5}(-\d{4})?$' }
+    LocalSearchRadius:
+      name: radius_miles
+      in: query
+      required: false
+      description: Dial stops at 10, 25, 50, 75, 100 miles.
+      schema: { $ref: '#/components/schemas/RadiusMiles' }
+    CuisineIds:
+      name: cuisine_ids
+      in: query
+      required: false
+      style: form
+      explode: false
+      description: Comma-separated cuisine ids from `/reference/cuisines`.
+      schema:
+        type: array
+        uniqueItems: true
+        items: { type: string }
+    RestaurantId:
+      name: restaurant_id
+      in: path
+      required: true
+      schema: { type: string }
+    RecipeId:
+      name: recipe_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    ValidationError:
+      description: One or more fields are invalid. UI shows "Please correct invalid fields" and highlights each `field_errors[].field`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: VALIDATION_ERROR
+            message: Please correct invalid fields
+            field_errors:
+              - { field: email, code: EMAIL_IN_USE, message: This email is already in use. }
+              - { field: birthday, code: UNDERAGE, message: You must be at least 18 years old. }
+    Unauthorized:
+      description: Missing or expired access token (`UNAUTHORIZED`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found (`NOT_FOUND`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: Rate limited (`RATE_LIMITED`).
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InvalidOrExpiredToken:
+      description: Email/reset token invalid or expired (`INVALID_TOKEN`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadLocation:
+      description: No usable location supplied, or postal code not recognised (`LOCATION_REQUIRED` / `UNKNOWN_POSTAL_CODE`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    # ── Errors ──
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code (UPPER_SNAKE_CASE).
+          examples: [VALIDATION_ERROR]
+        message:
+          type: string
+          description: Human-readable message safe to show the user.
+        field_errors:
+          type: array
+          items: { $ref: '#/components/schemas/FieldError' }
+    FieldError:
+      type: object
+      required: [field, code, message]
+      properties:
+        field:
+          type: string
+          description: Request field name (dot path for nested fields, e.g. `address.postal_code`).
+        code:
+          type: string
+          enum: [REQUIRED, INVALID_FORMAT, INVALID_EMAIL, EMAIL_IN_USE, UNDERAGE, WEAK_PASSWORD, PASSWORD_MISMATCH, INCORRECT_PASSWORD, INVALID_INGREDIENT_FORMAT, OUT_OF_RANGE, INVALID_VALUE]
+        message: { type: string }
+    LoginFailedError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          required: [attempts_remaining]
+          properties:
+            attempts_remaining:
+              type: integer
+              minimum: 0
+              maximum: 2
+
+    # ── Auth ──
+    Password:
+      type: string
+      format: password
+      minLength: 12
+      maxLength: 128
+      description: |
+        Complexity rules (enforced server-side, returned as `WEAK_PASSWORD`): at least 12 characters,
+        containing an uppercase letter, a lowercase letter, a digit and a symbol.
+    SignupRequest:
+      type: object
+      required: [first_name, last_name, email, birthday, password, password_confirm]
+      properties:
+        first_name: { type: string, minLength: 1, maxLength: 100 }
+        last_name: { type: string, minLength: 1, maxLength: 100 }
+        email: { type: string, format: email, maxLength: 254 }
+        birthday:
+          type: string
+          format: date
+          description: User must be 18 or older.
+        password: { $ref: '#/components/schemas/Password' }
+        password_confirm: { type: string, format: password }
+    SignupResponse:
+      type: object
+      required: [user_id, email, message]
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        message: { type: string, examples: [Please confirm your email address] }
+    EmailRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+    EmailTokenRequest:
+      type: object
+      required: [token]
+      properties:
+        token: { type: string, description: Single-use token from the emailed link. }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+    LoginChallenge:
+      type: object
+      required: [challenge_id, expires_at]
+      properties:
+        challenge_id: { type: string, description: Short-lived id tying the CAPTCHA step to the verified credentials. }
+        expires_at: { type: string, format: date-time }
+    CaptchaRequest:
+      type: object
+      required: [challenge_id, captcha_token]
+      properties:
+        challenge_id: { type: string }
+        captcha_token: { type: string, description: Token returned by the CAPTCHA widget. }
+    AuthTokens:
+      type: object
+      required: [access_token, token_type, expires_in, user]
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, const: bearer }
+        expires_in: { type: integer, description: Seconds until the access token expires. }
+        user: { $ref: '#/components/schemas/User' }
+    ResetPasswordRequest:
+      type: object
+      required: [token, password, password_confirm]
+      properties:
+        token: { type: string }
+        password: { $ref: '#/components/schemas/Password' }
+        password_confirm: { type: string, format: password }
+    ChangePasswordRequest:
+      type: object
+      required: [current_password, new_password, new_password_confirm]
+      properties:
+        current_password: { type: string, format: password }
+        new_password: { $ref: '#/components/schemas/Password' }
+        new_password_confirm: { type: string, format: password }
+
+    # ── Users ──
+    Address:
+      type: object
+      required: [line1, city, state, postal_code, country]
+      properties:
+        line1: { type: string, maxLength: 200 }
+        line2: { type: [string, 'null'], maxLength: 200 }
+        city: { type: string, maxLength: 100 }
+        state: { type: string, maxLength: 100, description: 'State/region code, e.g. `CA`.' }
+        postal_code: { type: string, maxLength: 20 }
+        country: { type: string, minLength: 2, maxLength: 2, default: US, description: ISO 3166-1 alpha-2. }
+    User:
+      type: object
+      required: [id, email, email_verified, first_name, last_name, birthday, age, onboarding_completed, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        pending_email:
+          type: [string, 'null']
+          format: email
+          description: New email awaiting confirmation.
+        email_verified: { type: boolean }
+        first_name: { type: string }
+        last_name: { type: string }
+        birthday: { type: string, format: date }
+        age: { type: integer, readOnly: true, description: Derived from birthday. }
+        address:
+          oneOf:
+            - $ref: '#/components/schemas/Address'
+            - type: 'null'
+        avatar_id: { type: [string, 'null'], description: Selected character from `/reference/avatars`. }
+        onboarding_completed:
+          type: boolean
+          description: False until the survey is completed; the frontend routes to the survey while false.
+        diet:
+          oneOf:
+            - $ref: '#/components/schemas/Diet'
+            - type: 'null'
+          description: Convenience copy of the survey's diet choice.
+        created_at: { type: string, format: date-time }
+    UserUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        first_name: { type: string, minLength: 1, maxLength: 100 }
+        last_name: { type: string, minLength: 1, maxLength: 100 }
+        email: { type: string, format: email }
+        birthday: { type: string, format: date }
+        address:
+          oneOf:
+            - $ref: '#/components/schemas/Address'
+            - type: 'null'
+        avatar_id: { type: [string, 'null'] }
+
+    # ── Survey ──
+    Diet:
+      type: string
+      enum: [vegan, vegetarian, mediterranean]
+    HealthGoal:
+      type: string
+      enum: [lower_cholesterol, build_muscle, lower_blood_pressure, lose_weight, athletic_performance]
+    Motivation:
+      type: string
+      enum: [environment, personal_health, factory_farming]
+    IncomeBand:
+      type: string
+      enum:
+        - under_25k
+        - 25k_50k
+        - 50k_75k
+        - 75k_100k
+        - 100k_150k
+        - 150k_200k
+        - 200k_plus
+        - prefer_not_to_say
+    SurveyAnswers:
+      type: object
+      properties:
+        diet: { $ref: '#/components/schemas/Diet' }
+        cuisine_ids:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+          description: Cuisines picked from the food images.
+        health_goals:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/HealthGoal' }
+        motivations:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Motivation' }
+        income_band:
+          description: Optional. Used to tailor restaurant recommendations and food item lists.
+          oneOf:
+            - $ref: '#/components/schemas/IncomeBand'
+            - type: 'null'
+    SurveyUpdate:
+      allOf:
+        - $ref: '#/components/schemas/SurveyAnswers'
+      minProperties: 1
+    SurveyResponse:
+      allOf:
+        - $ref: '#/components/schemas/SurveyAnswers'
+        - type: object
+          required: [updated_at]
+          properties:
+            completed_at: { type: [string, 'null'], format: date-time }
+            updated_at: { type: string, format: date-time }
+    LabeledOption:
+      type: object
+      required: [value, label]
+      properties:
+        value: { type: string }
+        label: { type: string }
+        description: { type: [string, 'null'] }
+    SurveyOptions:
+      type: object
+      required: [diets, cuisines, health_goals, motivations, income_bands]
+      properties:
+        diets: { type: array, items: { $ref: '#/components/schemas/LabeledOption' } }
+        cuisines: { type: array, items: { $ref: '#/components/schemas/Cuisine' } }
+        health_goals: { type: array, items: { $ref: '#/components/schemas/LabeledOption' } }
+        motivations: { type: array, items: { $ref: '#/components/schemas/LabeledOption' } }
+        income_bands: { type: array, items: { $ref: '#/components/schemas/LabeledOption' } }
+        income_band_note:
+          type: string
+          examples: [We use this data to give you more catered restaurant recommendations and food item lists.]
+
+    # ── Reference ──
+    Cuisine:
+      type: object
+      required: [id, name, image_url, country_code]
+      properties:
+        id: { type: string, examples: [indian] }
+        name: { type: string, examples: [Indian] }
+        image_url: { type: string, format: uri, description: Representative dish image (e.g. curry). }
+        country_code: { type: string, description: 'ISO 3166-1 alpha-2, for the flag badge.' }
+        flag_url: { type: [string, 'null'], format: uri }
+    Avatar:
+      type: object
+      required: [id, name, image_url]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        image_url: { type: string, format: uri }
+
+    # ── Billing ──
+    Plan:
+      type: object
+      required: [id, name, price_cents, currency, interval, features]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        price_cents: { type: integer, minimum: 0 }
+        currency: { type: string, examples: [usd] }
+        interval: { type: string, enum: [month, year] }
+        features: { type: array, items: { type: string } }
+    SubscriptionStatus:
+      type: string
+      enum: [trialing, active, past_due, canceled, incomplete]
+    Subscription:
+      type: object
+      required: [id, plan, status, cancel_at_period_end]
+      properties:
+        id: { type: string }
+        plan: { $ref: '#/components/schemas/Plan' }
+        status: { $ref: '#/components/schemas/SubscriptionStatus' }
+        current_period_end: { type: [string, 'null'], format: date-time }
+        cancel_at_period_end: { type: boolean }
+    SubscriptionCreate:
+      type: object
+      required: [plan_id]
+      properties:
+        plan_id: { type: string }
+    PaymentSetup:
+      type: object
+      required: [client_secret, publishable_key]
+      properties:
+        client_secret: { type: string }
+        publishable_key: { type: string }
+    PaymentMethodSummary:
+      type: object
+      required: [brand, last4, exp_month, exp_year]
+      properties:
+        brand: { type: string, examples: [visa] }
+        last4: { type: string, pattern: '^\d{4}$' }
+        exp_month: { type: integer, minimum: 1, maximum: 12 }
+        exp_year: { type: integer }
+        billing_address:
+          oneOf:
+            - $ref: '#/components/schemas/Address'
+            - type: 'null'
+
+    # ── Impact / Home / Reports ──
+    EnvironmentalImpact:
+      type: object
+      description: Savings relative to a baseline average omnivore diet for the same period.
+      required: [co2e_kg_saved, water_liters_saved, land_m2_saved]
+      properties:
+        co2e_kg_saved: { type: number }
+        water_liters_saved: { type: number }
+        land_m2_saved: { type: number }
+        animals_spared: { type: [number, 'null'] }
+    NutrientHighlight:
+      type: object
+      required: [nutrient, message, source_foods]
+      properties:
+        nutrient: { type: string, examples: [anthocyanins] }
+        message:
+          type: string
+          examples: [Blueberries and black beans gave you anthocyanins, which support heart health.]
+        source_foods: { type: array, items: { type: string } }
+        amount: { type: [number, 'null'] }
+        unit: { type: [string, 'null'] }
+    HealthImpact:
+      type: object
+      required: [highlights]
+      properties:
+        fiber_g: { type: [number, 'null'] }
+        protein_g: { type: [number, 'null'] }
+        saturated_fat_g: { type: [number, 'null'] }
+        cholesterol_mg: { type: [number, 'null'] }
+        sodium_mg: { type: [number, 'null'] }
+        highlights: { type: array, items: { $ref: '#/components/schemas/NutrientHighlight' } }
+        goal_progress:
+          type: array
+          description: Progress notes per survey health goal.
+          items:
+            type: object
+            required: [goal, summary]
+            properties:
+              goal: { $ref: '#/components/schemas/HealthGoal' }
+              summary: { type: string }
+    MoneySaved:
+      type: object
+      required: [amount_cents, currency]
+      properties:
+        amount_cents: { type: integer }
+        currency: { type: string, examples: [usd] }
+    WeeklyImpact:
+      type: object
+      required: [week_start, week_end, environmental, health, money_saved]
+      properties:
+        week_start: { type: string, format: date }
+        week_end: { type: string, format: date }
+        environmental: { $ref: '#/components/schemas/EnvironmentalImpact' }
+        health: { $ref: '#/components/schemas/HealthImpact' }
+        money_saved: { $ref: '#/components/schemas/MoneySaved' }
+        headline: { type: string, examples: [You helped avoid 12.4 kg of CO2 emissions this week!] }
+    BigPicture:
+      type: object
+      required: [community_total, community_this_week, user_share_percent, active_members, featured_recipes, featured_articles]
+      properties:
+        community_total: { $ref: '#/components/schemas/EnvironmentalImpact' }
+        community_this_week: { $ref: '#/components/schemas/EnvironmentalImpact' }
+        user_share_percent: { type: number, description: User's share of this week's community impact. }
+        active_members: { type: integer }
+        featured_recipes:
+          type: array
+          description: Community favorite recipes.
+          items: { $ref: '#/components/schemas/RecipeSummary' }
+        featured_articles: { type: array, items: { $ref: '#/components/schemas/Article' } }
+    Quote:
+      type: object
+      required: [text, date]
+      properties:
+        text: { type: string }
+        author: { type: [string, 'null'] }
+        date: { type: string, format: date }
+    ReportPeriod:
+      type: string
+      enum: [week, month, year]
+    ReportDataPoint:
+      type: object
+      required: [bucket_start, environmental, money_saved]
+      properties:
+        bucket_start: { type: string, format: date, description: Day (week/month view) or month (year view). }
+        environmental: { $ref: '#/components/schemas/EnvironmentalImpact' }
+        money_saved: { $ref: '#/components/schemas/MoneySaved' }
+    Report:
+      type: object
+      required: [period, start_date, end_date, environmental, health, money_saved, series]
+      properties:
+        period: { $ref: '#/components/schemas/ReportPeriod' }
+        start_date: { type: string, format: date }
+        end_date: { type: string, format: date }
+        environmental: { $ref: '#/components/schemas/EnvironmentalImpact' }
+        health: { $ref: '#/components/schemas/HealthImpact' }
+        money_saved: { $ref: '#/components/schemas/MoneySaved' }
+        series:
+          type: array
+          description: Time series for the charts.
+          items: { $ref: '#/components/schemas/ReportDataPoint' }
+
+    # ── Shopping lists / Foods ──
+    ShoppingListItemInput:
+      type: object
+      required: [food_id, quantity, unit]
+      properties:
+        food_id: { type: string }
+        quantity: { type: number, exclusiveMinimum: 0 }
+        unit: { type: string, examples: [g, kg, oz, lb, item] }
+        price_cents: { type: [integer, 'null'], minimum: 0, description: Optional actual price paid. }
+    ShoppingListItem:
+      allOf:
+        - $ref: '#/components/schemas/ShoppingListItemInput'
+        - type: object
+          required: [id, food_name]
+          properties:
+            id: { type: string, format: uuid }
+            food_name: { type: string }
+    ShoppingListCreate:
+      type: object
+      required: [name, items]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        purchased_on: { type: [string, 'null'], format: date }
+        items: { type: array, items: { $ref: '#/components/schemas/ShoppingListItemInput' } }
+    ShoppingList:
+      type: object
+      required: [id, name, items, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        purchased_on: { type: [string, 'null'], format: date }
+        items: { type: array, items: { $ref: '#/components/schemas/ShoppingListItem' } }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ShoppingListPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ShoppingList' } }
+        next_cursor: { type: [string, 'null'] }
+    FoodSummary:
+      type: object
+      required: [id, name, category]
+      properties:
+        id: { type: string, description: Internal id (mapped to USDA FDC id). }
+        name: { type: string }
+        category: { type: string }
+        fdc_id: { type: [integer, 'null'] }
+    FoodDetail:
+      allOf:
+        - $ref: '#/components/schemas/FoodSummary'
+        - type: object
+          required: [nutrients_per_100g]
+          properties:
+            nutrients_per_100g:
+              type: array
+              items:
+                type: object
+                required: [name, amount, unit]
+                properties:
+                  name: { type: string }
+                  amount: { type: number }
+                  unit: { type: string }
+            co2e_kg_per_kg: { type: [number, 'null'], description: Our World in Data. }
+            water_liters_per_kg: { type: [number, 'null'] }
+            land_m2_per_kg: { type: [number, 'null'] }
+            avg_price_cents_per_kg: { type: [integer, 'null'] }
+
+    # ── Places ──
+    GeoPoint:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat: { type: number }
+        lng: { type: number }
+    OpeningHours:
+      type: object
+      required: [day_of_week, opens, closes]
+      properties:
+        day_of_week: { type: integer, minimum: 0, maximum: 6, description: 0 = Monday. }
+        opens: { type: string, pattern: '^\d{2}:\d{2}$', examples: ['09:00'] }
+        closes: { type: string, pattern: '^\d{2}:\d{2}$', examples: ['17:00'] }
+        note: { type: [string, 'null'], description: e.g. "May–Oct only" for seasonal markets. }
+    Contact:
+      type: object
+      properties:
+        phone: { type: [string, 'null'] }
+        website: { type: [string, 'null'], format: uri }
+        email: { type: [string, 'null'], format: email }
+    Place:
+      type: object
+      description: Fields shared by every map/list result (name, address, hours, contact).
+      required: [id, name, address, location, hours, contact, distance_miles]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        address: { $ref: '#/components/schemas/Address' }
+        location: { $ref: '#/components/schemas/GeoPoint' }
+        hours: { type: array, items: { $ref: '#/components/schemas/OpeningHours' } }
+        contact: { $ref: '#/components/schemas/Contact' }
+        distance_miles: { type: number }
+        image_url: { type: [string, 'null'], format: uri }
+    Restaurant:
+      allOf:
+        - $ref: '#/components/schemas/Place'
+        - type: object
+          required: [cuisine_ids, diets_supported, is_favorite]
+          properties:
+            cuisine_ids: { type: array, items: { type: string } }
+            diets_supported: { type: array, items: { $ref: '#/components/schemas/Diet' } }
+            price_level: { type: [integer, 'null'], minimum: 1, maximum: 4 }
+            rating: { type: [number, 'null'], minimum: 0, maximum: 5 }
+            is_favorite: { type: boolean }
+    RestaurantPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Restaurant' } }
+        next_cursor: { type: [string, 'null'] }
+        search_center:
+          description: Center used for the search (useful when searching by postal code).
+          oneOf:
+            - $ref: '#/components/schemas/GeoPoint'
+            - type: 'null'
+    RadiusMiles:
+      type: integer
+      enum: [10, 25, 50, 75, 100]
+      default: 10
+    LocalFoodType:
+      type: string
+      enum: [farmers_market, coop, local_grocer]
+      description: '`coop` = CSA-style monthly payment to a farm for a share of its produce.'
+    LocalFoodPlace:
+      allOf:
+        - $ref: '#/components/schemas/Place'
+        - type: object
+          required: [type]
+          properties:
+            type: { $ref: '#/components/schemas/LocalFoodType' }
+    LocalFoodPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/LocalFoodPlace' } }
+        next_cursor: { type: [string, 'null'] }
+        search_center:
+          oneOf:
+            - $ref: '#/components/schemas/GeoPoint'
+            - type: 'null'
+    CommunityOrgType:
+      type: string
+      enum: [food_pantry, soup_kitchen, community_garden]
+    CommunityOrg:
+      allOf:
+        - $ref: '#/components/schemas/Place'
+        - type: object
+          required: [type]
+          properties:
+            type: { $ref: '#/components/schemas/CommunityOrgType' }
+            how_to_help: { type: [string, 'null'], description: Volunteer / donation instructions. }
+    CommunityOrgPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/CommunityOrg' } }
+        next_cursor: { type: [string, 'null'] }
+        search_center:
+          oneOf:
+            - $ref: '#/components/schemas/GeoPoint'
+            - type: 'null'
+
+    # ── Recipes ──
+    RecipeSummary:
+      type: object
+      required: [id, title, image_url, cuisine_id, diets, is_favorite]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        image_url: { type: string, format: uri }
+        cuisine_id: { type: string }
+        diets: { type: array, items: { $ref: '#/components/schemas/Diet' } }
+        total_time_minutes: { type: [integer, 'null'] }
+        is_favorite: { type: boolean }
+        matched_ingredient_count:
+          type: [integer, 'null']
+          description: Present when searching by `ingredients`.
+    RecipeIngredient:
+      type: object
+      required: [name, display_text]
+      properties:
+        food_id: { type: [string, 'null'] }
+        name: { type: string }
+        quantity: { type: [number, 'null'] }
+        unit: { type: [string, 'null'] }
+        display_text: { type: string, examples: [1 cup cooked chickpeas] }
+    Recipe:
+      allOf:
+        - $ref: '#/components/schemas/RecipeSummary'
+        - type: object
+          required: [servings, ingredients, steps]
+          properties:
+            description: { type: [string, 'null'] }
+            servings: { type: integer, minimum: 1 }
+            prep_time_minutes: { type: [integer, 'null'] }
+            cook_time_minutes: { type: [integer, 'null'] }
+            ingredients: { type: array, items: { $ref: '#/components/schemas/RecipeIngredient' } }
+            steps: { type: array, items: { type: string } }
+            nutrition_per_serving:
+              type: object
+              properties:
+                calories: { type: [number, 'null'] }
+                protein_g: { type: [number, 'null'] }
+                fiber_g: { type: [number, 'null'] }
+                fat_g: { type: [number, 'null'] }
+                carbs_g: { type: [number, 'null'] }
+            environmental_per_serving:
+              oneOf:
+                - $ref: '#/components/schemas/EnvironmentalImpact'
+                - type: 'null'
+    RecipeSummaryPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/RecipeSummary' } }
+        next_cursor: { type: [string, 'null'] }
+
+    # ── Content ──
+    Article:
+      type: object
+      required: [id, title, summary, url, published_at]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        summary: { type: string }
+        url: { type: string, format: uri }
+        image_url: { type: [string, 'null'], format: uri }
+        topic: { type: [string, 'null'] }
+        published_at: { type: string, format: date-time }
+    ArticlePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Article' } }
+        next_cursor: { type: [string, 'null'] }
+
+    # ── Assistant ──
+    Conversation:
+      type: object
+      required: [id, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ConversationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Conversation' } }
+        next_cursor: { type: [string, 'null'] }
+    MessageCreate:
+      type: object
+      required: [content]
+      properties:
+        content: { type: string, minLength: 1, maxLength: 8000 }
+    Message:
+      type: object
+      required: [id, role, content, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+        created_at: { type: string, format: date-time }
+    MessagePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Message' } }
+        next_cursor: { type: [string, 'null'] }
+
+    # ── Support ──
+    BugReportCreate:
+      type: object
+      required: [description]
+      properties:
+        description: { type: string, minLength: 10, maxLength: 5000 }
+        page_url: { type: [string, 'null'] }
+        user_agent: { type: [string, 'null'] }
+    ContactCreate:
+      type: object
+      required: [subject, message]
+      properties:
+        subject: { type: string, minLength: 1, maxLength: 200 }
+        message: { type: string, minLength: 1, maxLength: 5000 }
+    SupportTicket:
+      type: object
+      required: [id, created_at]
+      properties:
+        id: { type: string }
+        created_at: { type: string, format: date-time }

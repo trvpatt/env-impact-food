@@ -1,0 +1,23 @@
+# Local dependency folders (Docker installs fresh Linux versions during build)
+**/node_modules
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+
+# Secrets and local environment variables
+.env
+.env.*
+*.pem
+*.key
+
+# Git and IDE clutter
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+
+# Build outputs (Docker will compile fresh ones)
+**/dist
+**/build
