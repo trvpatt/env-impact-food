@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: Plant-Forward Web App API
+  title: Rooted Web App API
   version: 0.1.0
   summary: Backend API (FastAPI) consumed by the TypeScript web frontend.
   description: |
@@ -42,11 +42,11 @@ tags:
   - name: Survey
     description: Onboarding survey (diet, cuisine preferences, health goals, motivation, income band).
   - name: Reference
-    description: Static/look-up data used to render the UI (survey options, cuisines, avatars).
+    description: Static/look-up data used to render the UI (survey options, cuisines, avatars, research papers).
   - name: Billing
     description: Subscription and payment method (card data handled by third-party provider).
   - name: Home
-    description: Weekly positive impact, "The Big Picture" community stats, daily quote.
+    description: Weekly positive impact data summary visualization, "The Big Picture" community stats, daily quote.
   - name: Reports
     description: Detailed environmental, health and savings report filtered by week / month / year.
   - name: Shopping Lists
@@ -57,7 +57,7 @@ tags:
     description: Restaurant finder and favorite restaurants.
   - name: Recipes
     description: Recipe finder and favorite recipes.
-  - name: Local Food
+  - name: Local Produce
     description: Farmers' markets, co-ops, and local grocers.
   - name: Get Involved
     description: Food pantries, soup kitchens, community gardens.
@@ -749,18 +749,13 @@ paths:
         - $ref: '#/components/parameters/Lat'
         - $ref: '#/components/parameters/Lng'
         - $ref: '#/components/parameters/PostalCode'
+        - $ref: '#/components/parameters/LocalSearchRadius'
         - name: diet
           in: query
           required: true
           description: '"I''m looking for" selector.'
           schema: { $ref: '#/components/schemas/Diet' }
         - $ref: '#/components/parameters/CuisineIds'
-        - name: radius_miles
-          in: query
-          required: false
-          schema: { type: number, minimum: 1, maximum: 100, default: 10 }
-        - $ref: '#/components/parameters/Cursor'
-        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
           description: Matching restaurants.
@@ -929,7 +924,7 @@ paths:
   # ───────────────────────────── LOCAL FOOD ─────────────────────────────
   /local-food/search:
     get:
-      tags: [Local Food]
+      tags: [Local Produce]
       operationId: search_local_food
       summary: Find farmers' markets, co-ops and local grocers
       description: |

@@ -1,0 +1,13 @@
+# Runtime dependencies for the API. Pinned; update deliberately.
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.4
+pydantic-settings==2.16.3
+email-validator==2.3.0
+sqlmodel==0.0.42
+SQLAlchemy==2.0.54
+alembic==1.20.1
+psycopg[binary]==3.3.9
+PyJWT==2.15.1
+httpx==0.28.1
+anthropic==1.11.0

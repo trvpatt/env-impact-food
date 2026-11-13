@@ -1,0 +1,38 @@
+# Local development stack: same image and same kind of backing services as production.
+#   docker compose -f infra/docker-compose.yml up --build
+#   docker compose -f infra/docker-compose.yml run --rm api alembic upgrade head
+#   docker compose -f infra/docker-compose.yml run --rm api python -m scripts.seed_reference_data
+services:
+  api:
+    build: ../backend
+    env_file: ../.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://rooted:rooted@db:5432/rooted
+      SMTP_HOST: mail
+      SMTP_PORT: "1025"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - mail
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: rooted
+      POSTGRES_PASSWORD: rooted
+      POSTGRES_DB: rooted
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Catches outgoing email; web UI at http://localhost:8025
+  mail:
+    image: axllent/mailpit
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+volumes:
+  pgdata:

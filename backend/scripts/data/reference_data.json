@@ -1,0 +1,23 @@
+{
+  "cuisines": [
+    {"id": "indian", "name": "Indian", "image_url": "https://placehold.co/400x300?text=Indian", "country_code": "IN", "sort_order": 1},
+    {"id": "italian", "name": "Italian", "image_url": "https://placehold.co/400x300?text=Italian", "country_code": "IT", "sort_order": 2},
+    {"id": "mexican", "name": "Mexican", "image_url": "https://placehold.co/400x300?text=Mexican", "country_code": "MX", "sort_order": 3},
+    {"id": "japanese", "name": "Japanese", "image_url": "https://placehold.co/400x300?text=Japanese", "country_code": "JP", "sort_order": 4},
+    {"id": "ethiopian", "name": "Ethiopian", "image_url": "https://placehold.co/400x300?text=Ethiopian", "country_code": "ET", "sort_order": 5},
+    {"id": "lebanese", "name": "Lebanese", "image_url": "https://placehold.co/400x300?text=Lebanese", "country_code": "LB", "sort_order": 6}
+  ],
+  "avatars": [
+    {"id": "sprout", "name": "Sprout", "image_url": "https://placehold.co/128?text=Sprout", "sort_order": 1},
+    {"id": "acorn", "name": "Acorn", "image_url": "https://placehold.co/128?text=Acorn", "sort_order": 2}
+  ],
+  "quotes": [
+    {"id": 1, "text": "Small changes on your plate add up to big changes for the planet."},
+    {"id": 2, "text": "Every meal is a chance to choose what kind of world you want."},
+    {"id": 3, "text": "Eat the rainbow, and leave a lighter footprint."}
+  ],
+  "plans": [
+    {"id": "free", "name": "Free", "price_cents": 0, "currency": "usd", "interval": "month", "features": ["Weekly impact summary", "Recipe finder"], "sort_order": 1},
+    {"id": "plus_monthly", "name": "Plus", "price_cents": 499, "currency": "usd", "interval": "month", "features": ["Detailed reports", "AI assistant"], "sort_order": 2}
+  ]
+}

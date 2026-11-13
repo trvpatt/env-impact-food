@@ -222,3 +222,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local databases and OS clutter
+*.db
+*.sqlite3
+.DS_Store
