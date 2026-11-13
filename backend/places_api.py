@@ -5,7 +5,7 @@ from typing import Any, Literal
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GOOGLE_PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
@@ -20,6 +20,8 @@ PLACE_FIELDS = ",".join(
         "places.rating",
         "places.userRatingCount",
         "places.primaryTypeDisplayName",
+        "places.nationalPhoneNumber",
+        "places.regularOpeningHours",
     )
 )
 
@@ -30,7 +32,24 @@ class PlaceSearchRequest(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     area: str | None = None
-    diet: Literal["vegan", "vegetarian"] = "vegetarian"
+    diet: Literal["vegan", "vegetarian", "mediterranean"] = "vegetarian"
+    cuisine: str | None = None
+    radius_miles: Literal[5, 10, 15, 20] = 10
+
+
+class DirectorySearchRequest(BaseModel):
+    area: str
+    categories: list[
+        Literal[
+            "farmers markets",
+            "farm co-ops CSA",
+            "local produce grocery stores",
+            "food pantries",
+            "soup kitchens",
+            "community gardens",
+        ]
+    ] = Field(min_length=1, max_length=3)
+    radius_miles: Literal[10, 25, 50, 75, 100] = 10
 
 
 @app.get("/")
@@ -57,24 +76,30 @@ async def search_places(request: PlaceSearchRequest) -> dict[str, list[dict[str,
             detail="Google Places is not configured. Set GOOGLE_PLACES_API_KEY on the backend.",
         )
 
+    cuisine = request.cuisine.strip() if request.cuisine else ""
+    if len(cuisine) > 40:
+        raise HTTPException(status_code=400, detail="Choose a cuisine up to 40 characters.")
+
     text_query: str
     body: dict[str, Any] = {"maxResultCount": 20}
     if request.area is not None:
         area = request.area.strip()
         if not area or len(area) > 160:
             raise HTTPException(status_code=400, detail="Enter an area up to 160 characters.")
-        text_query = f"{request.diet} restaurants in {area}"
+        cuisine_query = f"{cuisine} " if cuisine else ""
+        text_query = f"{request.diet} {cuisine_query}restaurants near {area} within {request.radius_miles} miles"
     elif request.latitude is not None and request.longitude is not None:
         if not (-90 <= request.latitude <= 90 and -180 <= request.longitude <= 180):
             raise HTTPException(status_code=400, detail="The coordinates are outside valid ranges.")
-        text_query = f"{request.diet} restaurants"
+        cuisine_query = f"{cuisine} " if cuisine else ""
+        text_query = f"{request.diet} {cuisine_query}restaurants"
         body["locationBias"] = {
             "circle": {
                 "center": {
                     "latitude": request.latitude,
                     "longitude": request.longitude,
                 },
-                "radius": 10000,
+                "radius": min(request.radius_miles * 1609.34, 50000),
             }
         }
     else:
@@ -85,6 +110,30 @@ async def search_places(request: PlaceSearchRequest) -> dict[str, list[dict[str,
 
     body["textQuery"] = text_query
 
+    return await fetch_google_places(body, api_key)
+
+
+@app.post("/api/places/directory-search")
+async def search_directory(request: DirectorySearchRequest) -> dict[str, list[dict[str, Any]]]:
+    api_key = os.getenv("GOOGLE_PLACES_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Google Places is not configured. Set GOOGLE_PLACES_API_KEY on the backend.",
+        )
+
+    area = request.area.strip()
+    if not area or len(area) > 160:
+        raise HTTPException(status_code=400, detail="Enter an area up to 160 characters.")
+
+    categories = ", ".join(request.categories)
+    text_query = f"{categories} near {area} within {request.radius_miles} miles"
+    return await fetch_google_places({"textQuery": text_query, "maxResultCount": 20}, api_key)
+
+
+async def fetch_google_places(
+    body: dict[str, Any], api_key: str
+) -> dict[str, list[dict[str, Any]]]:
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
@@ -134,20 +183,27 @@ async def search_places(request: PlaceSearchRequest) -> dict[str, list[dict[str,
             detail="Google Places returned an unexpected response. Try again later.",
         )
 
+    return {"places": [serialize_place(place) for place in places]}
+
+
+def serialize_place(place: dict[str, Any]) -> dict[str, Any]:
+    display_name = place.get("displayName") or {}
+    location = place.get("location") or {}
+    primary_type = place.get("primaryTypeDisplayName") or {}
+    opening_hours = place.get("regularOpeningHours") or {}
+    weekday_descriptions = opening_hours.get("weekdayDescriptions")
+
     return {
-        "places": [
-            {
-                "id": place.get("id"),
-                "name": place.get("displayName", {}).get("text", "Restaurant"),
-                "address": place.get("formattedAddress", ""),
-                "latitude": place.get("location", {}).get("latitude"),
-                "longitude": place.get("location", {}).get("longitude"),
-                "googleMapsUri": place.get("googleMapsUri"),
-                "websiteUri": place.get("websiteUri"),
-                "rating": place.get("rating"),
-                "userRatingCount": place.get("userRatingCount"),
-                "primaryType": place.get("primaryTypeDisplayName", {}).get("text"),
-            }
-            for place in places
-        ]
+        "id": place.get("id"),
+        "name": display_name.get("text") or "Local place",
+        "address": place.get("formattedAddress") or "",
+        "latitude": location.get("latitude"),
+        "longitude": location.get("longitude"),
+        "googleMapsUri": place.get("googleMapsUri"),
+        "websiteUri": place.get("websiteUri"),
+        "rating": place.get("rating"),
+        "userRatingCount": place.get("userRatingCount"),
+        "primaryType": primary_type.get("text"),
+        "phone": place.get("nationalPhoneNumber"),
+        "hours": weekday_descriptions if isinstance(weekday_descriptions, list) else [],
     }
